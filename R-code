@@ -1,0 +1,442 @@
+---
+title: "Google Analytics Project"
+author: "Sam Matina and Yuanying Zheng"
+date: "November 9, 2018"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)
+library(bigvis)
+library(tidyverse)
+library(jsonlite)
+library(lubridate)
+library(ggplot2)
+library(readr)
+library(randomForest)
+library(verification)
+
+```
+
+For our project we participated in the Google Analytics Customer Revenue Prediction Kaggle competition. The description of the competition is given below.
+
+>In this competition, you're challenged to analyze a Google Merchandise Store (also known as GStore, where Google swag is sold) customer dataset to predict revenue per customer. Hopefully, the outcome will be more actionable operational changes and a better use of marketing budgets for those companies who choose to use data analysis on top of GA data.
+
+## Reading and Processing the Data
+
+Note that most of the code in this section was taken from any of three Kaggle kernels by Troy Walters, Erik Bruin, and kxx respectively. Ideas from the three are all intermixed throughout, so it's hard to cite each instance properly. URLs for each kernel will be given at the end.
+
+```{r}
+train <- read_csv("train.csv")
+```
+
+The first thing we notice is that some of the columns are in JSON format and need to be flattened.
+
+```{r}
+# Flatten JSON columns
+tr_device <- paste("[", paste(train$device, collapse = ","), "]") %>% fromJSON(flatten = T)
+tr_geoNetwork <- paste("[", paste(train$geoNetwork, collapse = ","), "]") %>% fromJSON(flatten = T)
+tr_totals <- paste("[", paste(train$totals, collapse = ","), "]") %>% fromJSON(flatten = T)
+tr_trafficSource <- paste("[", paste(train$trafficSource, collapse = ","), "]") %>% fromJSON(flatten = T)
+
+#Combine to make the full training and test sets
+train <- train %>%
+  cbind(tr_device, tr_geoNetwork, tr_totals, tr_trafficSource) %>%
+  dplyr::select(-device, -geoNetwork, -totals, -trafficSource)
+
+rm(tr_device)
+rm(tr_geoNetwork)
+rm(tr_totals)
+rm(tr_trafficSource)
+
+# Convert to tibble because tibbles are better
+train <- tbl_df(train)
+```
+
+Next there are a bunch of other data processing steps to take dealing with missing values.
+
+```{r}
+# Convert other values to NA
+is_na_val <- function(x) x %in% c("not available in demo dataset", "(not provided)",
+                                  "(not set)", "<NA>", "unknown.unknown",  "(none)")
+
+train <- train %>% mutate_all(funs(ifelse(is_na_val(.), NA, .)))
+
+
+# Convert some character variables into factors
+factorVars <- c("channelGrouping", "browser", "operatingSystem", "deviceCategory", "country", 
+                "fullVisitorId", "sessionId", "continent", "subContinent", "region", "metro",
+                "city", "source", "medium", "networkDomain")
+train[, factorVars] <- lapply(train[, factorVars], as.factor)
+
+# Also converting the data variable to the date format
+train$date <- ymd(train$date)
+
+# Convert character variables into numeric
+numVars <- c("visits", "hits", "bounces", "pageviews", "newVisits")
+train[, numVars] <- lapply(train[, numVars], as.integer)
+
+# Convert visit start times to POSIXct
+train$visitStartTime <- as.POSIXct(train$visitStartTime, tz="UTC", origin="1970-01-01")
+
+# Get number of unique values in each column
+unique <- sapply(train, function(x) { length(unique(x[!is.na(x)])) })
+
+# subset to == 1
+one_val <- names(unique[unique <= 1])
+
+# but keep bounces and newVisits
+one_val = setdiff(one_val, c("bounces", "newVisits"))
+
+# drop columns from train
+train <- train %>% dplyr::select(-one_of(one_val))
+```
+
+Here is a barchart of the percentage of missing values for each variable.
+
+```{r}
+# bar chart of missing values
+train %>% summarise_all(funs(sum(is.na(.))/n()*100)) %>% 
+  gather(key="feature", value="missing_pct") %>% 
+  ggplot(aes(x=reorder(feature,-missing_pct),y=missing_pct)) +
+  geom_bar(stat="identity", fill="steelblue")+
+  labs(y = "missing %", x = "features") +
+  coord_flip() +
+  theme_minimal()
+```
+
+A lot of variables are almost missing entirely. Some of these are the variables that weren't available in the demo data set. Most of these variables with a lot of missing values will be dropped.
+
+```{r}
+# Drop variables with mostly missing values
+vars <- c("campaign", "keyword", "referralPath", "adContent", "adwordsClickInfo.page", 
+          "adwordsClickInfo.slot", "adwordsClickInfo.gclId", "adwordsClickInfo.adNetworkType")
+
+train <- train %>% dplyr::select(-one_of(vars))
+
+
+# Convert date and time variables to year, month, day, and hour and drop date
+train <- train %>% mutate(year = year(date) %>% factor(), 
+                          month = month(date) %>% factor(),
+                          wday = wday(date) %>% factor(),
+                          hour = hour(as_datetime(visitStartTime)) %>% factor())
+
+
+train <- train %>% dplyr::select(-date)
+
+# Set NAs for bounces and newVisits to 
+train$bounces[is.na(train$bounces)] <- 0
+train$newVisits[is.na(train$newVisits)] <- 0
+
+# Conver year to factor
+train$year <- factor(train$year, c("2016", "2017", "2018"))
+
+```
+
+Now that the JSON columns are fixed and the data is more workable, let's look at the dependent variable, transactionRevenue. The first thing we have to do is take the log. Then set all of the NA observations to 0.
+
+```{r}
+
+train$transactionRevenue <- as.numeric(train$transactionRevenue)
+# Take log of transactionRevenue
+logRevenue <- log(train$transactionRevenue)
+
+# Set NAs in logRevenue to 0 and add to train data set
+logRevenue[is.na(logRevenue)] <- 0
+train <- mutate(train, logRevenue)
+
+# Drop transactionRevenue
+train <- train %>% dplyr::select(-transactionRevenue)
+
+# Final variable for train set
+keep.vars.train <- c("logRevenue", "fullVisitorId", "month", "channelGrouping", "year", "hour", "visitId", 
+                     "visitNumber", "operatingSystem", "isMobile", "deviceCategory", "continent", "subContinent",
+                     "hits","pageviews", "bounces", "newVisits", "medium")
+train <- train %>% dplyr::select(keep.vars.train)
+```
+
+Now we'll take a look at the log revenue.
+
+```{r}
+ggplot(train, aes(x=logRevenue)) +
+  geom_histogram(fill="blue", binwidth=10) 
+```
+
+The data is extremely right skewed. Almost all of the observations had zero revenue. This makes sense if you've ever shopped online--you usually don't actually buy annything.
+
+Next, we'll look at just the transactions that had nonzero revenue.
+
+```{r}
+train %>% filter(logRevenue > 0) %>%
+  ggplot(aes(x = logRevenue)) +
+  geom_histogram(fill = "blue")
+```
+
+This looks approximately normal. Good news!
+
+Now before running any models, we'll load and process the test set just so it's ready when we want to predict.
+
+```{r}
+test <- read_csv("test.csv")
+
+# Flatten JSON columns
+te_device <- paste("[", paste(test$device, collapse = ","), "]") %>% fromJSON(flatten = T)
+te_geoNetwork <- paste("[", paste(test$geoNetwork, collapse = ","), "]") %>% fromJSON(flatten = T)
+te_totals <- paste("[", paste(test$totals, collapse = ","), "]") %>% fromJSON(flatten = T)
+te_trafficSource <- paste("[", paste(test$trafficSource, collapse = ","), "]") %>% fromJSON(flatten = T)
+
+#Combine to create full test set
+test <- test %>%
+  cbind(te_device, te_geoNetwork, te_totals, te_trafficSource) %>%
+  dplyr::select(-device, -geoNetwork, -totals, -trafficSource)
+
+# Convert to tibble
+test <- tbl_df(test)
+
+rm(te_device)
+rm(te_geoNetwork)
+rm(te_totals)
+rm(te_trafficSource)
+
+# Convert missing values to NA
+test <- test %>% mutate_all(funs(ifelse(is_na_val(.), NA, .)))
+
+
+# Change variables to factor
+test[, factorVars] <- lapply(test[, factorVars], as.factor)
+
+# Format the date
+test$date <- ymd(test$date)
+
+# Change variables to numeric
+test[, numVars] <- lapply(test[, numVars], as.integer)
+
+# Format the time
+test$visitStartTime <- as.POSIXct(test$visitStartTime, tz="UTC", origin="1970-01-01")
+
+# Drop variables
+test <- test %>% dplyr::select(-one_of(one_val))
+test <- test %>% dplyr::select(-one_of(vars))
+
+# Split the date to year, month, day, and hour
+test <- test %>% mutate(year = year(date) %>% factor(),
+                        month = month(date) %>% factor(),
+                        wday = wday(date) %>% factor(),
+                        hour = hour(as_datetime(visitStartTime)) %>% factor())
+
+# Drop date
+test <- test %>% dplyr::select(-date)
+
+# Set NAs in bounces and newVisits to 0
+test$bounces[is.na(test$bounces)] <- 0
+test$newVisits[is.na(test$newVisits)] <- 0
+
+# Select final variables for models
+keep.vars.test <- c("fullVisitorId", "month", "channelGrouping", "year", "hour", "visitId", "visitNumber",
+                    "operatingSystem", "isMobile", "deviceCategory", "continent", "subContinent", "hits",
+                    "pageviews", "bounces", "newVisits", "medium")
+
+
+test <- test %>% dplyr::select(keep.vars.test)
+
+# Convert year to a factor
+test$year <- factor(test$year, c("2016", "2017", "2018"))
+
+# Match factor levels for operating system
+train$operatingSystem <- factor(train$operatingSystem, c("Android", "BlackBerry", "Chrome OS", "Firefox OS",
+                                                         "FreeBSD" ,"iOS", "Linux",        
+                                                         "Macintosh", "Nintendo 3DS", "Nintendo Wii", 
+                                                         "Nintendo   WiiU", "Nokia", "NTT DoCoMo", "OpenBSD",
+                                                         "Samsung", "SunOS", "Windows", "Windows Phone", "Xbox",
+                                                         "OS/2", "Playstation Vita", "SymbianOS", "Tizen"))
+test$operatingSystem <- factor(test$operatingSystem, c("Android", "BlackBerry", "Chrome OS", "Firefox OS",
+                                                       "FreeBSD" ,"iOS", "Linux",        
+                                                       "Macintosh", "Nintendo 3DS", "Nintendo Wii",
+                                                       "Nintendo WiiU", "Nokia", "NTT DoCoMo", "OpenBSD",
+                                                       "Samsung", "SunOS", "Windows", "Windows Phone", "Xbox",
+                                                       "OS/2", "Playstation Vita", "SymbianOS", "Tizen"))
+
+
+# Drop unneeded values
+rm(keep.vars)
+rm(logRevenue)
+rm(factorVars)
+rm(numVars)
+rm(one_val)
+rm(col)
+rm(unique)
+rm(vars)
+rm(keep.vars.test)
+rm(keep.vars.train)
+```
+
+
+## Linear Model
+
+A lot of the issues with fitting a linear model were addressed in the initial data processing steps. There were a ton of missing values, some of the variables were in weird formats.
+
+```{r}
+lm <- lm(formula = logRevenue ~ channelGrouping + year + hour + visitId + visitNumber + 
+           operatingSystem + isMobile + deviceCategory + continent + subContinent + 
+           hits + pageviews + bounces + newVisits + medium, train)
+```
+
+
+
+## Random Forests
+
+We think the problem is much more suited for random forests. Since there is a time association in the revenue, our idea was to split the data by month and run a random forest for each month. Then we'll average the predictions for all the months and get a final prediction from that.
+
+First we filtered the data by month and took a sample from each month to save memory.
+
+```{r}
+set.seed(308)
+
+# Filter by month and take a sample to save memory
+rev_jan <- train %>% filter(month == 1) %>% sample_n(size = 1000)
+rev_feb <- train %>% filter(month == 2) %>% sample_n(size = 1000)
+rev_mar <- train %>% filter(month == 3) %>% sample_n(size = 1000)
+rev_apr <- train %>% filter(month == 4) %>% sample_n(size = 1000)
+rev_may <- train %>% filter(month == 5) %>% sample_n(size = 1000)
+rev_jun <- train %>% filter(month == 6) %>% sample_n(size = 1000)
+rev_jul <- train %>% filter(month == 7) %>% sample_n(size = 1000)
+rev_aug <- train %>% filter(month == 8) %>% sample_n(size = 1000)
+rev_sep <- train %>% filter(month == 9) %>% sample_n(size = 1000)
+rev_oct <- train %>% filter(month == 10) %>% sample_n(size = 1000)
+rev_nov <- train %>% filter(month == 11) %>% sample_n(size = 1000)
+rev_dec <- train %>% filter(month == 12) %>% sample_n(size = 1000)
+```
+
+
+Next we ran 12 random forests, one for each month.
+
+```{r}
+# RF for January
+train.rf.jan <- randomForest(formula = logRevenue ~ channelGrouping + year + hour + 
+                           visitId + visitNumber + 
+                           operatingSystem + isMobile + deviceCategory + continent + subContinent + 
+                           hits + pageviews + bounces + newVisits + medium, data = rev_jan, importance = TRUE,
+                           na.action = na.omit)
+
+
+
+#RF for February
+train.rf.feb <- randomForest(formula = logRevenue ~ channelGrouping + year + hour + 
+                           visitId + visitNumber +
+                           operatingSystem + isMobile + deviceCategory + continent + subContinent + 
+                           hits + pageviews + bounces + newVisits + medium, data = rev_feb, importance = TRUE,
+                           na.action = na.exclude)
+
+
+#RF for March
+train.rf.mar <- randomForest(formula = logRevenue ~ channelGrouping + year + hour + 
+                           visitId + visitNumber +
+                           operatingSystem + isMobile + deviceCategory + continent + subContinent + 
+                           hits + pageviews + bounces + newVisits + medium, data = rev_mar, importance = TRUE, 
+                           na.action = na.omit)
+
+#RF for April
+train.rf.apr <- randomForest(formula = logRevenue ~ channelGrouping + year + hour + 
+                           visitId + visitNumber + 
+                           operatingSystem + isMobile + deviceCategory + continent + subContinent + 
+                           hits + pageviews + bounces + newVisits + medium, data = rev_apr, importance = TRUE, 
+                           na.action = na.omit)
+
+#RF for May
+train.rf.may <- randomForest(formula = logRevenue ~ channelGrouping + year + hour + 
+                           visitId + visitNumber +
+                           operatingSystem + isMobile + deviceCategory + continent + subContinent + 
+                           hits + pageviews + bounces + newVisits + medium, data = rev_may, importance = TRUE, 
+                           na.action = na.omit)
+
+#RF for June
+train.rf.jun <- randomForest(formula = logRevenue ~ channelGrouping + year + hour + 
+                           visitId + visitNumber +
+                           operatingSystem + isMobile + deviceCategory + continent + subContinent + 
+                           hits + pageviews + bounces + newVisits + medium, data = rev_jun, importance = TRUE, 
+                           na.action = na.omit)
+
+#RF for July
+train.rf.jul <- randomForest(formula = logRevenue ~ channelGrouping + year + hour + 
+                           visitId + visitNumber +
+                           operatingSystem + isMobile + deviceCategory + continent + subContinent + 
+                           hits + pageviews + bounces + newVisits + medium, data = rev_jul, importance = TRUE, 
+                           na.action = na.omit)
+
+#RF for August
+train.rf.aug <- randomForest(formula = logRevenue ~ channelGrouping + year + hour + 
+                           visitId + visitNumber +
+                           operatingSystem + isMobile + deviceCategory + continent + subContinent + 
+                           hits + pageviews + bounces + newVisits + medium, data = rev_aug, importance = TRUE, 
+                           na.action = na.omit)
+
+#RF for September
+train.rf.sep <- randomForest(formula = logRevenue ~ channelGrouping + year + hour + 
+                           visitId + visitNumber +
+                           operatingSystem + isMobile + deviceCategory + continent + subContinent + 
+                           hits + pageviews + bounces + newVisits + medium, data = rev_sep, importance = TRUE, 
+                           na.action = na.omit)
+
+#RF for October
+train.rf.oct <- randomForest(formula = logRevenue ~ channelGrouping + year + hour + 
+                           visitId + visitNumber + 
+                           operatingSystem + isMobile + deviceCategory + continent + subContinent + 
+                           hits + pageviews + bounces + newVisits + medium, data = rev_oct, importance = TRUE,
+                           na.action = na.omit)
+
+#RF for November
+train.rf.nov <- randomForest(formula = logRevenue ~ channelGrouping + year + hour + 
+                           visitId + visitNumber +
+                           operatingSystem + isMobile + deviceCategory + continent + subContinent + 
+                           hits + pageviews + bounces + newVisits + medium, data = rev_nov, importance = TRUE, 
+                           na.action = na.omit)
+
+#RF for December
+train.rf.dec <- randomForest(formula = logRevenue ~ channelGrouping + year + hour + 
+                           visitId + visitNumber +  
+                           operatingSystem + isMobile + deviceCategory + continent + subContinent + 
+                           hits + pageviews + bounces + newVisits + medium, data = rev_dec, importance = TRUE, 
+                           na.action = na.omit)
+```
+
+Then we took predictions from each random forest and averaged them all.
+
+```{r}
+pred.jan <- predict(train.rf.jan, newdata = test)
+pred.feb <- predict(train.rf.feb, newdata = test)
+pred.mar <- predict(train.rf.mar, newdata = test)
+pred.apr <- predict(train.rf.apr, newdata = test)
+pred.may <- predict(train.rf.may, newdata = test)
+pred.jun <- predict(train.rf.jun, newdata = test)
+pred.jul <- predict(train.rf.jul, newdata = test)
+pred.aug <- predict(train.rf.aug, newdata = test)
+pred.sep <- predict(train.rf.sep, newdata = test)
+pred.oct <- predict(train.rf.oct, newdata = test)
+pred.nov <- predict(train.rf.nov, newdata = test)
+pred.dec <- predict(train.rf.dec, newdata = test)
+
+mean.rf <-rowMeans(cbind(pred.jan, pred.feb, pred.mar, pred.apr, pred.may, pred.jun, pred.jul, pred.aug,
+                    pred.sep, pred.oct, pred.nov, pred.dec))
+
+head(mean.rf)
+
+
+mean.rf <- tbl_df(mean.rf)
+mean.rf$value[is.na(mean.rf$value)] <- 0
+```
+
+
+## Results
+
+The results of this process weren't great. Our RMSE was 1.8618, which was good enough to not be dead last in the competition. This was with no tuning on the random forests at all. The main problem with the model was probably that it predicted too much revenue. It would most likely work better if we first predicted which transactions would have revenue and then predicted the actual revenue on only those observations, leaving the rest as zero.
+
+
+
+## References
+1. Troy Walters. A Very Extensive GStore Exploratory Analysis. https://www.kaggle.com/captcalculator/a-very-extensive-gstore-exploratory-analysis
+
+2. Erik Bruin. Google Analytics EDA + LightGBM + Screenshots. https://www.kaggle.com/erikbruin/google-analytics-eda-lightgbm-screenshots
+
+3. kxx. R EDA for GStore + GLM + Keras + XGB. https://www.kaggle.com/kailex/r-eda-for-gstore-glm-keras-xgb
