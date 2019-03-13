@@ -1,6 +1,6 @@
 # Google-Analytics
 
-I participated in the Google Analytics Customer Revenue Prediction competition on Kaggle for a group project in a Big Data Analytics class at Utah State University. The main point of the project was to get our hands dirty with big datasets and at least basic machine learning techniques. The project was done entirely in R, and the final R Markdown and pdf files are included.
+I participated in the Google Analytics Customer Revenue Prediction competition on Kaggle for a group project in a Big Data Analytics class at Utah State University. The main point of the project was to get our hands dirty with big datasets and at least basic machine learning techniques. The project was done entirely in R, and the final R Markdown file is included.
 
 Here is the description for the Kaggle competition.
 
