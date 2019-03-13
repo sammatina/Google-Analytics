@@ -11,3 +11,5 @@ Here is the description for the Kaggle competition.
 >In this competition, you’re challenged to analyze a Google Merchandise Store (also known as GStore, where Google swag is sold) customer dataset to predict revenue per customer. Hopefully, the outcome will be more actionable operational changes and a better use of marketing budgets for those companies who choose to use data analysis on top of GA data.
 
 The models were judged based on RMSE. Our model got and RMSE of 1.8618, which was decent (not last in the competition or in the class), but not great. Even though we didn't get the best score, it was a great experience taking a project through all the way from data processing to prediction.
+
+The competition webpage can be found [here](https://www.kaggle.com/c/ga-customer-revenue-prediction). The data files are found under the "data" tab.
